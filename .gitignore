@@ -1,0 +1,22 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+wandb/
+
+# Generated: run outputs, frame cache, wandb runs, model weights
+artifacts/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Raw data (videos, master table, pose, faces) is NOT distributed -- obtain it separately and
+# put it at data/ (a folder, or a symlink to wherever the dataset lives). Never commit it.
+/data
+*.mp4
+*.avi
+*.mov
+
+# The reviewed participant label CSVs live in annot/ and ARE tracked (the TAPPFL/attack code
+# needs them to run).
