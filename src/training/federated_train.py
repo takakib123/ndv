@@ -26,6 +26,7 @@ import random
 import time
 from copy import deepcopy
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -55,6 +56,10 @@ def parse_args():
     p.add_argument("--client-batch-size", type=int, default=config.FL_CLIENT_BATCH_SIZE)
     p.add_argument("--data-workers", type=int, default=config.NUM_WORKERS,
                    help="DataLoader worker processes preparing upcoming clients' batches")
+    p.add_argument("--resume", default=None,
+                   help="Existing run folder to continue from its checkpoints/last_model.pt. FedAvg keeps "
+                        "no optimizer state across rounds, so resuming only needs the global weights.")
+    p.add_argument("--wandb-id", default=None, help="W&B run id to append to when resuming")
     p.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
     return p.parse_args()
 
@@ -216,10 +221,14 @@ def main():
     redactor = parse_condition(args.train_redaction)
     redacted = not redactor.is_identity
 
-    run_name = datetime.now().strftime("%d_%B_%H%M%S")
-    if redacted:
-        run_name += f"_{redactor.key()}"
-    run_dir = config.FED_OUTPUT_DIR / run_name
+    if args.resume:
+        run_dir = Path(args.resume)
+        run_name = run_dir.name
+    else:
+        run_name = datetime.now().strftime("%d_%B_%H%M%S")
+        if redacted:
+            run_name += f"_{redactor.key()}"
+        run_dir = config.FED_OUTPUT_DIR / run_name
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -296,23 +305,35 @@ def main():
         "val_clips": len(val_ds),
         "test_clips": len(test_ds),
     }
-    with open(run_dir / "fl_config.json", "w") as f:
-        json.dump(fl_cfg, f, indent=2)
+    if not args.resume:   # keep the original run's config file untouched on resume
+        with open(run_dir / "fl_config.json", "w") as f:
+            json.dump(fl_cfg, f, indent=2)
     logger.info(f"Config: {json.dumps(fl_cfg)}")
-
-    use_wandb = not args.no_wandb
-    if use_wandb:
-        wandb.init(project="ndv-action-federated", name=run_name, config=fl_cfg)
 
     # Federated rounds
     best_val_acc = 0.0
+    start_round = 1
+    if args.resume:
+        last = torch.load(ckpt_dir / "last_model.pt", map_location=device, weights_only=False)
+        model.load_state_dict(last["model_state_dict"])
+        start_round = last["epoch"] + 1
+        if (ckpt_dir / "best_model.pt").exists():
+            best_val_acc = torch.load(ckpt_dir / "best_model.pt", map_location="cpu",
+                                      weights_only=False)["val_acc"]
+        logger.info(f"Resumed from round {last['epoch']} (best val_acc so far {best_val_acc:.4f})")
+
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        wandb.init(project="ndv-action-federated", name=run_name, config=fl_cfg,
+                   id=args.wandb_id, resume="allow" if args.wandb_id else None)
+
     history = []
     sample_rng = random.Random(config.SEED)
 
     logger.info(f"Starting federated training: {args.rounds} rounds x {args.local_epochs} local "
                 f"epochs x {n_per_round}/{len(client_ids)} clients/round")
 
-    for rnd in tqdm(range(1, args.rounds + 1), desc="FL rounds"):
+    for rnd in tqdm(range(start_round, args.rounds + 1), desc="FL rounds"):
         if n_per_round >= len(client_ids):
             selected = client_ids
         else:
@@ -357,7 +378,8 @@ def main():
             torch.save(ckpt, ckpt_dir / "best_model.pt")
             logger.info(f"  ** New best val_acc={best_val_acc:.4f} — checkpoint saved")
 
-    with open(run_dir / "round_history.json", "w") as f:
+    # On resume this holds only the resumed rounds; train.log has the full history.
+    with open(run_dir / ("round_history.json" if start_round == 1 else f"round_history_from_{start_round}.json"), "w") as f:
         json.dump(history, f, indent=2)
     logger.info(f"Training complete. Best val_acc={best_val_acc:.4f}")
 
