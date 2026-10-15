@@ -180,6 +180,14 @@ def parse_args():
     p.add_argument("--train-redaction", default="none",
                    help="Redaction applied to train/val/test clips, e.g. face_blur_s0.5, face_black. "
                         "'none' trains on clean video.")
+    p.add_argument("--seed", type=int, default=None,
+                   help="Training seed (init, shuffling, augmentation). The participant split "
+                        "always uses config.SEED, so runs with different seeds stay comparable. "
+                        "Default: config.SEED.")
+    p.add_argument("--patience", type=int, default=None,
+                   help="Stop after this many epochs without a new best val_acc. The LR schedule "
+                        "still spans config.NUM_EPOCHS, so it matches a full run up to the stop. "
+                        "Default: no early stopping.")
     return p.parse_args()
 
 
@@ -188,10 +196,12 @@ if __name__ == "__main__":
     redactor = parse_condition(args.train_redaction)
     redacted = not redactor.is_identity
 
+    seed = config.SEED if args.seed is None else args.seed
+
     # Reproducibility
-    random.seed(config.SEED)
-    np.random.seed(config.SEED)
-    torch.manual_seed(config.SEED)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -200,6 +210,8 @@ if __name__ == "__main__":
     run_name = datetime.now().strftime("%d_%B_%H%M%S")
     if redacted:
         run_name += f"_{redactor.key()}"
+    if args.seed is not None:
+        run_name += f"_seed{seed}"
     run_dir = config.OUTPUT_DIR / "results" / run_name
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -257,11 +269,13 @@ if __name__ == "__main__":
         "warmup_epochs": config.WARMUP_EPOCHS,
         "grad_clip": config.GRAD_CLIP,
         "amp": config.AMP,
-        "seed": config.SEED,
+        "seed": seed,
+        "split_seed": config.SEED,
         "train_clips": len(train_ds),
         "val_clips": len(val_ds),
         "test_clips": len(test_ds),
         "train_redaction": redactor.key(),
+        "patience": args.patience,
     }
     with open(run_dir / "config.json", "w") as f:
         json.dump(cfg, f, indent=2)
@@ -270,6 +284,7 @@ if __name__ == "__main__":
     wandb.init(project="ndv-action-classification", name=run_name, config=cfg)
 
     best_val_acc = 0.0
+    epochs_since_best = 0
     global_step = 0
     history = []
 
@@ -320,6 +335,7 @@ if __name__ == "__main__":
         # Save best checkpoint (local only)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            epochs_since_best = 0
             best_ckpt_path = ckpt_dir / "best_model.pt"
             torch.save(ckpt, best_ckpt_path)
             # Stable copy for downstream scripts (evaluate.py / attack_inference.py). Only for
@@ -327,6 +343,11 @@ if __name__ == "__main__":
             if not redacted:
                 torch.save(ckpt, config.CHECKPOINT_DIR / "best_model.pt")
             logger.info(f"  ** New best val_acc={best_val_acc:.4f} — checkpoint saved")
+        else:
+            epochs_since_best += 1
+            if args.patience is not None and epochs_since_best >= args.patience:
+                logger.info(f"Early stop: no val_acc improvement for {args.patience} epochs")
+                break
 
     # Save training history
     with open(run_dir / "train_history.json", "w") as f:
