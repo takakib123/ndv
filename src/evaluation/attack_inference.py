@@ -57,6 +57,7 @@ from tqdm import tqdm
 
 from src import config
 from src.data.dataset import ActionVideoDataset, load_filtered_df, _split_subjects
+from src.data.redaction import parse_condition, cache_tag as redaction_cache_tag
 from src.model import build_model
 
 ATTACK_DIR = config.OUTPUT_DIR / "attack"
@@ -72,6 +73,10 @@ def parse_args():
     p.add_argument("--checkpoint", type=Path, default=config.CHECKPOINT_DIR / "best_model.pt",
                    help="Path to the trained model checkpoint (.pt) to attack, or the literal "
                         "'pretrained' to attack the un-fine-tuned encoder (leakage floor)")
+    p.add_argument("--redaction", default="none",
+                   help="Redaction applied to every clip before the encoder sees it, e.g. "
+                        "face_blur_s0.5 to attack a blur-trained model on the inputs it was "
+                        "trained on. 'none' attacks clean video.")
     p.add_argument("--no-cache", action="store_true",
                    help="Recompute clip features even if a cached copy exists")
     return p.parse_args()
@@ -598,8 +603,12 @@ def main():
     if ckpt_path is not None and not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}. Run train.py first.")
 
+    redactor = parse_condition(args.redaction, seed=config.SEED)
+
     # Timestamped run folder (one self-contained folder per attack run)
     run_name = datetime.now().strftime("%d_%B_%H%M%S")
+    if not redactor.is_identity:
+        run_name += f"_{redactor.key()}"
     run_dir = ATTACK_DIR / "results" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     FEATURE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -608,6 +617,7 @@ def main():
     logger.info(f"Run: {run_name}")
     logger.info(f"Output dir: {run_dir}")
     logger.info(f"Checkpoint: {ckpt_path}")
+    logger.info(f"Attack-input redaction: {redactor.key()}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
@@ -620,6 +630,7 @@ def main():
         "checkpoint_epoch": int(ckpt["epoch"]),
         "checkpoint_val_acc": float(ckpt["val_acc"]),
         "model": config.MODEL_NAME,
+        "redaction": redactor.key(),
         "extract_batch_size": EXTRACT_BATCH_SIZE,
         "probe_cv": f"leave-one-participant-out (headline) + {int(PROBE_TRAIN_FRAC*100)}% weak-attacker check",
         "seed": config.SEED,
@@ -629,13 +640,15 @@ def main():
     logger.info(f"Config: {json.dumps(run_cfg)}")
 
     # Dataset + split membership
-    all_ds, train_subjects, val_subjects, test_subjects = build_subject_datasets()
+    all_ds, train_subjects, val_subjects, test_subjects = build_subject_datasets(redactor=redactor)
     logger.info(f"Total clips: {len(all_ds)}  |  "
           f"train={len(train_subjects)} val={len(val_subjects)} test={len(test_subjects)} subjects")
 
     # Extract per-clip backbone features. Cache is keyed by checkpoint (path + mtime)
     # so a different/retrained checkpoint never reuses stale features.
-    ckpt_key = feature_cache_key(ckpt_path)
+    # Same key scheme as redaction_leakage, so the two scripts share cached features.
+    rkey = redactor.key() if redactor.is_identity else f"{redactor.key()}|{redaction_cache_tag()}"
+    ckpt_key = feature_cache_key(ckpt_path, rkey)
     cache = FEATURE_CACHE_DIR / f"clip_features_{ckpt_key}.npz"
     if cache.exists() and not args.no_cache:
         data = np.load(cache, allow_pickle=True)
